@@ -4,13 +4,13 @@ AstroWeek Backend v2 — Kerykeion + Claude API
 - Транзиты текущей недели через Kerykeion
 - Аспекты транзит → натал
 - Прогноз через Claude API
+- Интерпретация аспектов через Claude API
 """
 
 import os
 import json
 import httpx
 import datetime
-from zoneinfo import ZoneInfo
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -78,6 +78,13 @@ class BirthRequest(BaseModel):
     city_name: str         # для отображения
 
 
+class AspectsRequest(BaseModel):
+    aspects: list[dict]    # список аспектов из /api/chart
+    sun_sign: str          # натальный знак Солнца
+    week_start: str        # "28.04.2026"
+    week_end: str          # "04.05.2026"
+
+
 # ── Вспомогательные функции ────────────────────────────────────
 
 def get_planet_list(subject) -> list[dict]:
@@ -88,7 +95,7 @@ def get_planet_list(subject) -> list[dict]:
         p = getattr(subject, key, None)
         if p is None:
             continue
-        name_en = p.name  # "Sun", "Moon", etc.
+        name_en = p.name
         planets.append({
             "name_en": name_en,
             "name": PLANET_RU.get(name_en, name_en),
@@ -141,7 +148,6 @@ def calc_transit_aspects(natal_subject, transit_subject) -> list[dict]:
             "orb": str(round(asp.orbit, 1)),
             "movement": getattr(asp, "aspect_movement", ""),
         })
-    # Сортируем по орбу (слабейший орб = сильнейший аспект)
     aspects.sort(key=lambda a: float(a["orb"]))
     return aspects[:12]
 
@@ -211,7 +217,7 @@ async def get_chart(req: BirthRequest):
         except Exception:
             raise HTTPException(400, "Неверный формат времени. Ожидается ЧЧ:ММ")
     else:
-        hour, minute = 12, 0  # полдень по умолчанию
+        hour, minute = 12, 0
 
     # 2. Натальная карта через Kerykeion (Swiss Ephemeris)
     try:
@@ -292,7 +298,7 @@ async def get_chart(req: BirthRequest):
 {aspect_desc}
 
 ПРАВИЛА:
-- Опирайся на конкретные аспекты и транеиты, упоминай планеты по имени
+- Опирайся на конкретные аспекты и транзиты, упоминай планеты по имени
 - Текст каждого раздела: 2 коротких предложения максимум, без воды
 - Правильные склонения и согласования на русском языке
 - Применяющиеся (Applying) аспекты важнее разделяющихся
@@ -332,3 +338,56 @@ async def get_chart(req: BirthRequest):
             "engine": "kerykeion+swisseph",
         }
     }
+
+
+@app.post("/api/aspects")
+async def get_aspects_text(req: AspectsRequest):
+    """
+    Принимает список транзитных аспектов и генерирует
+    через Claude профессиональные русскоязычные интерпретации.
+    Вызывается фронтендом асинхронно после /api/chart.
+    """
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(503, "ANTHROPIC_API_KEY не задан")
+
+    if not req.aspects:
+        return {"aspects": []}
+
+    asp_list = "\n".join(
+        f"{i + 1}. {a.get('transit', '')} ({a.get('transitSign', '')}) "
+        f"{a.get('symbol', '')} натальный {a.get('natal', '')} ({a.get('natalSign', '')}), "
+        f"орб {a.get('orb', '?')}°{', движение: ' + a['movement'] if a.get('movement') else ''}"
+        for i, a in enumerate(req.aspects[:5])
+    )
+
+    prompt = f"""Ты профессиональный астролог. Напиши интерпретацию транзитных аспектов недели для человека с натальным Солнцем в знаке {req.sun_sign}. Период: {req.week_start} — {req.week_end}.
+
+Аспекты (от сильнейшего к слабейшему по орбу):
+{asp_list}
+
+Требования к каждому аспекту:
+- Заголовок: одно чёткое предложение на русском с правильными падежами и родом. Формат: "Транзитный [планета] [аспект] натальный/натальную/натальное [планета]". Примеры: "Транзитный Марс образует квадратуру к натальному Сатурну", "Транзитная Венера формирует трин с натальной Луной", "Транзитное Солнце соединяется с натальным Меркурием"
+- Текст: 2 конкретных предложения — что означает этот аспект на практике и как с ним работать на этой неделе. Без эзотерики и штампов, пишите как грамотный специалист. Используй "вы" и правильные падежи.
+
+Верни ТОЛЬКО валидный JSON-массив без markdown-разметки:
+[
+  {{"title": "...", "text": "..."}},
+  {{"title": "...", "text": "..."}},
+  ...
+]"""
+
+    result = await call_claude(prompt)
+
+    if not isinstance(result, list):
+        raise HTTPException(500, "Claude вернул неожиданный формат")
+
+    enriched = []
+    for i, asp in enumerate(req.aspects[:5]):
+        claude_data = result[i] if i < len(result) else {}
+        enriched.append({
+            **asp,
+            "title": claude_data.get("title", f"{asp.get('transit', '')} {asp.get('symbol', '')} {asp.get('natal', '')}"),
+            "text": claude_data.get("text", ""),
+        })
+
+    return {"aspects": enriched}
