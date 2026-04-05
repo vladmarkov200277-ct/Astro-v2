@@ -28,7 +28,7 @@ app.add_middleware(
 )
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-CLAUDE_MODEL = "claude-sonnet-4-20250514"
+CLAUDE_MODEL = "claude-sonnet-4-6"
 
 # Русские названия знаков
 SIGN_RU = {
